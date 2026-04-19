@@ -112,6 +112,28 @@ int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out
     for (int i = 0; i < SHA256_DIGEST_LENGTH; i++) {
         sprintf(hash_hex + (i * 2), "%02x", hash[i]);
     }
+// 4. Create directory sharding: .pes/objects/XX/
+    char dir_path[PATH_MAX];
+    snprintf(dir_path, sizeof(dir_path), ".pes/objects/%.2s", hash_hex);
+    mkdir(dir_path, 0755);
+
+    // 5. Final path: .pes/objects/XX/XXXX...
+    char obj_path[PATH_MAX];
+    snprintf(obj_path, sizeof(obj_path), "%s/%s", dir_path, hash_hex + 2);
+
+    // 6. Atomic Write: Write to temp file, then rename
+    char temp_path[PATH_MAX];
+    snprintf(temp_path, sizeof(temp_path), ".pes/objects/tmp_XXXXXX");
+    int fd = mkstemp(temp_path);
+    if (fd < 0) return -1;
+    write(fd, header, header_len);
+    write(fd, data, size);
+    close(fd);
+    
+    if (rename(temp_path, obj_path) < 0) return -1;
+
+    strncpy(out_hash, hash_hex, SHA256_HEX_SIZE);
+    return 0;
     (void)type; (void)data; (void)len; (void)id_out;
     return -1;
 }
