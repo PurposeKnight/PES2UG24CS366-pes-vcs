@@ -1,20 +1,25 @@
 // tree.c — Tree object serialization and construction
 //
 // PROVIDED functions: get_file_mode, tree_parse, tree_serialize
-// TODO functions:     tree_from_index
+// TODO functions:      tree_from_index
 //
 // Binary tree format (per entry, concatenated with no separators):
-//   "<mode-as-ascii-octal> <name>\0<32-byte-binary-hash>"
+//    "<mode-as-ascii-octal> <name>\0<32-byte-binary-hash>"
 //
 // Example single entry (conceptual):
-//   "100644 hello.txt\0" followed by 32 raw bytes of SHA-256
+//    "100644 hello.txt\0" followed by 32 raw bytes of SHA-256
 
 #include "tree.h"
+#include "index.h"
+#include "pes.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <dirent.h>
 #include <sys/stat.h>
+
+// Forward declaration for the object store function to clear warnings
+int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out);
 
 // ─── Mode Constants ─────────────────────────────────────────────────────────
 
@@ -116,22 +121,102 @@ int tree_serialize(const Tree *tree, void **data_out, size_t *len_out) {
 
 // ─── TODO: Implement these ──────────────────────────────────────────────────
 
+/**
+ * Recursive helper to build a tree for a specific subdirectory level.
+ * Uses heap allocation to avoid stack-based Segmentation Faults.
+ */
+static int build_tree_recursive(const Index *idx, int start, int end, int depth, ObjectID *id_out) {
+    Tree *tree = malloc(sizeof(Tree));
+    if (!tree) return -1;
+    tree->count = 0;
+
+    for (int i = start; i < end; ) {
+        const IndexEntry *entry = &idx->entries[i];
+        
+        // Advance pointer to the correct directory depth
+        const char *curr = entry->path;
+        for (int d = 0; d < depth; d++) {
+            const char *slash = strchr(curr, '/');
+            if (slash) curr = slash + 1;
+        }
+
+        const char *next_slash = strchr(curr, '/');
+
+        if (next_slash == NULL) {
+            // CASE 1: File at this level
+            if (tree->count >= MAX_TREE_ENTRIES) { free(tree); return -1; }
+            
+            TreeEntry *te = &tree->entries[tree->count++];
+            te->mode = entry->mode;
+            strncpy(te->name, curr, sizeof(te->name) - 1);
+            te->name[sizeof(te->name) - 1] = '\0';
+            memcpy(te->hash.hash, entry->hash.hash, HASH_SIZE);
+            i++;
+        } else {
+            // CASE 2: Subdirectory
+            if (tree->count >= MAX_TREE_ENTRIES) { free(tree); return -1; }
+
+            TreeEntry *te = &tree->entries[tree->count++];
+            te->mode = MODE_DIR;
+            
+            size_t dlen = next_slash - curr;
+            if (dlen >= sizeof(te->name)) dlen = sizeof(te->name) - 1;
+            strncpy(te->name, curr, dlen);
+            te->name[dlen] = '\0';
+
+            // Group all entries that belong in this folder
+            int group_end = i;
+            while (group_end < end) {
+                const char *comp = idx->entries[group_end].path;
+                for (int d = 0; d < depth; d++) {
+                    const char *s = strchr(comp, '/');
+                    if (s) comp = s + 1;
+                }
+                if (strncmp(comp, te->name, dlen) == 0 && comp[dlen] == '/') {
+                    group_end++;
+                } else {
+                    break;
+                }
+            }
+
+            if (build_tree_recursive(idx, i, group_end, depth + 1, &te->hash) != 0) {
+                free(tree);
+                return -1;
+            }
+            i = group_end;
+        }
+    }
+
+    void *buf = NULL;
+    size_t len = 0;
+    if (tree_serialize(tree, &buf, &len) != 0) { free(tree); return -1; }
+    if (object_write(OBJ_TREE, buf, len, id_out) != 0) {
+        free(buf); free(tree); return -1;
+    }
+
+    free(buf);
+    free(tree);
+    return 0;
+}
+
 // Build a tree hierarchy from the current index and write all tree
 // objects to the object store.
-//
-// HINTS - Useful functions and concepts for this phase:
-//   - index_load      : load the staged files into memory
-//   - strchr          : find the first '/' in a path to separate directories from files
-//   - strncmp         : compare prefixes to group files belonging to the same subdirectory
-//   - Recursion       : you will likely want to create a recursive helper function 
-//                       (e.g., `write_tree_level(entries, count, depth)`) to handle nested dirs.
-//   - tree_serialize  : convert your populated Tree struct into a binary buffer
-//   - object_write    : save that binary buffer to the store as OBJ_TREE
-//
-// Returns 0 on success, -1 on error.
 int tree_from_index(ObjectID *id_out) {
-    // TODO: Implement recursive tree building
-    // (See Lab Appendix for logical steps)
-    (void)id_out;
-    return -1;
+    Index *idx = malloc(sizeof(Index));
+    if (!idx) return -1;
+
+    // Load index entries (passing pointer to local/heap struct)
+    if (index_load(idx) != 0) {
+        free(idx);
+        return -1;
+    }
+
+    if (idx->count == 0) {
+        free(idx);
+        return -1;
+    }
+
+    int result = build_tree_recursive(idx, 0, idx->count, 0, id_out);
+    free(idx);
+    return result;
 }
